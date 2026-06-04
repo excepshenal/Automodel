@@ -28,6 +28,7 @@ except ImportError:
 import gc
 import inspect
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -654,6 +655,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
         torch.cuda.reset_peak_memory_stats()
+        # Optional CUDA memory snapshot recording (env-gated). Dumped later in
+        # run_train_validation_loop at step MEMORY_PROFILE_STEP. View at
+        # https://pytorch.org/memory_viz by drag-and-drop.
+        if os.environ.get("MEMORY_PROFILE") == "1" and torch.cuda.is_available():
+            torch.cuda.memory._record_memory_history(
+                max_entries=200_000,
+                stacks="python",
+                context="all",
+                device=torch.cuda.current_device(),
+            )
         self.dist_env = initialize_distributed(
             backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
             timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
@@ -1061,44 +1072,105 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
+        # Optional torch.profiler (env-gated). View trace at https://ui.perfetto.dev
+        # or in TensorBoard's PyTorch Profiler tab.
+        rank = int(os.environ.get("RANK", "0"))
+        # All profile artifacts default to subdirs of checkpoint_dir so a single
+        # results root holds checkpoints, training.jsonl, profile traces, and
+        # memory snapshots together.
+        results_root = self.checkpointer.config.checkpoint_dir
+        if os.environ.get("TORCH_PROFILE") == "1":
+            prof_dir = os.environ.get("TORCH_PROFILE_DIR", f"{results_root}/profiler_traces")
+            profiler_ctx = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    wait=int(os.environ.get("TORCH_PROFILE_WAIT", "1")),
+                    warmup=int(os.environ.get("TORCH_PROFILE_WARMUP", "1")),
+                    active=int(os.environ.get("TORCH_PROFILE_ACTIVE", "1")),
+                    repeat=1,
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(f"{prof_dir}/rank{rank}"),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+        else:
+            profiler_ctx = nullcontext()
+
+        # Memory snapshot dump step (env-gated). Records started in setup().
+        mem_snapshot_step = (
+            int(os.environ.get("MEMORY_PROFILE_STEP", "3"))
+            if os.environ.get("MEMORY_PROFILE") == "1"
+            else None
+        )
+        mem_snapshot_done = False
+
         pbar = self._make_progress_bar()
         try:
-            for epoch in self.step_scheduler.epochs:
-                self.step_scheduler.set_epoch(epoch)
-                # The step scheduler yields a list of batches with the following properties:
-                # 1. len(batches) == grad_acc_steps
-                # 2. len(batches[0]) == batch_size
-                for batches in self.step_scheduler:
-                    # If QAT delayed fake-quant is configured, enable after threshold
-                    self._enable_qat_if_delayed(self.step_scheduler.step)
-                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                    # Collect MoE load balance metrics (all ranks participate in all-reduce)
-                    self._collect_moe_load_balance()
-                    # log
-                    self.log_train_metrics(train_log_data)
-                    self._update_progress_bar(pbar, train_log_data.metrics)
+            with profiler_ctx as prof:
+                for epoch in self.step_scheduler.epochs:
+                    self.step_scheduler.set_epoch(epoch)
+                    # The step scheduler yields a list of batches with the following properties:
+                    # 1. len(batches) == grad_acc_steps
+                    # 2. len(batches[0]) == batch_size
+                    for batches in self.step_scheduler:
+                        # If QAT delayed fake-quant is configured, enable after threshold
+                        self._enable_qat_if_delayed(self.step_scheduler.step)
+                        train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                        # Collect MoE load balance metrics (all ranks participate in all-reduce)
+                        self._collect_moe_load_balance()
+                        # log
+                        self.log_train_metrics(train_log_data)
+                        self._update_progress_bar(pbar, train_log_data.metrics)
 
-                    # Run validation every val_every_steps
-                    val_losses = {}
-                    if self.step_scheduler.is_val_step:
-                        for val_name, val_dataloader in self.val_dataloaders.items():
-                            val_log_data = self._run_validation_epoch(val_dataloader)
-                            val_losses[val_name] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
-                        for mp in self.model_parts:
-                            mp.train()
+                        # Advance torch.profiler one tick (no-op when profiling is off).
+                        if prof is not None:
+                            prof.step()
 
-                    # Save the checkpoint every ckpt_every_steps
-                    if self.step_scheduler.is_ckpt_step:
-                        self.save_checkpoint(
-                            epoch,
-                            self.step_scheduler.step,
-                            train_log_data.metrics["loss"],
-                            val_losses,
-                            best_metric_key=self.best_metric_key,
-                        )
-                    self._maybe_collect_garbage()
+                        # Dump CUDA memory snapshot at the configured step (one-shot).
+                        if (
+                            mem_snapshot_step is not None
+                            and not mem_snapshot_done
+                            and self.step_scheduler.step >= mem_snapshot_step
+                        ):
+                            snap_dir = os.environ.get("MEMORY_SNAPSHOT_DIR", f"{results_root}/memory_snapshots")
+                            os.makedirs(snap_dir, exist_ok=True)
+                            snap_path = f"{snap_dir}/rank{rank}_step{self.step_scheduler.step}.pickle"
+                            torch.cuda.memory._dump_snapshot(snap_path)
+                            torch.cuda.memory._record_memory_history(enabled=None)
+                            print(f"[MEM] rank{rank} dumped snapshot to {snap_path}", flush=True)
+                            mem_snapshot_done = True
+
+                        # Run validation every val_every_steps
+                        val_losses = {}
+                        if self.step_scheduler.is_val_step:
+                            for val_name, val_dataloader in self.val_dataloaders.items():
+                                val_log_data = self._run_validation_epoch(val_dataloader)
+                                val_losses[val_name] = val_log_data.metrics["val_loss"]
+                                self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                            for mp in self.model_parts:
+                                mp.train()
+
+                        # Save the checkpoint every ckpt_every_steps
+                        if self.step_scheduler.is_ckpt_step:
+                            self.save_checkpoint(
+                                epoch,
+                                self.step_scheduler.step,
+                                train_log_data.metrics["loss"],
+                                val_losses,
+                                best_metric_key=self.best_metric_key,
+                            )
+                        self._maybe_collect_garbage()
         finally:
+            # Make sure memory recording is off even on early exit / crash.
+            if os.environ.get("MEMORY_PROFILE") == "1" and not mem_snapshot_done:
+                try:
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                except Exception:
+                    pass
             if pbar is not None:
                 pbar.close()
         # Close JSONL loggers after training loop completes
