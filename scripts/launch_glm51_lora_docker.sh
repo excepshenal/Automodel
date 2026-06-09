@@ -44,6 +44,11 @@
 #                        fabric/container lacks IBGDA support)
 #   NNODES      2
 #   NODE_RANK   0
+#   NEMO_BASE_MODEL_LOAD_LAYER_CHUNK
+#               unset/0  load the full model in one to_hf pass (original behavior).
+#               GLM-5.1 (~744B) OOMs at load on 2 nodes because to_hf materializes a
+#               2nd copy of the EP-sharded experts. Set to e.g. 4 to load 4 decoder
+#               layers per chunk and cap the load-time peak (~92GB + a few GB/rank).
 #   RDZV_ENDPOINT  127.0.0.1:29500   (override to <node0-ip>:29500 for 2-node)
 #   EXTRA_ARGS  ""  appended to the automodel CLI call
 
@@ -158,6 +163,7 @@ exec docker run --rm \
     ${NVSHMEM_DISABLE_CUDA_VMM:+-e NVSHMEM_DISABLE_CUDA_VMM="$NVSHMEM_DISABLE_CUDA_VMM"} \
     ${NVSHMEM_HCA_LIST:+-e NVSHMEM_HCA_LIST="$NVSHMEM_HCA_LIST"} \
     ${NVSHMEM_HCA_PE_MAPPING:+-e NVSHMEM_HCA_PE_MAPPING="$NVSHMEM_HCA_PE_MAPPING"} \
+    ${NEMO_BASE_MODEL_LOAD_LAYER_CHUNK:+-e NEMO_BASE_MODEL_LOAD_LAYER_CHUNK="$NEMO_BASE_MODEL_LOAD_LAYER_CHUNK"} \
     ${MEMORY_PROFILE:+-e MEMORY_PROFILE="$MEMORY_PROFILE"} \
     ${MEMORY_PROFILE_STEP:+-e MEMORY_PROFILE_STEP="$MEMORY_PROFILE_STEP"} \
     ${MEMORY_SNAPSHOT_DIR:+-e MEMORY_SNAPSHOT_DIR="$MEMORY_SNAPSHOT_DIR"} \

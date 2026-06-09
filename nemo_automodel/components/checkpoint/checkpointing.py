@@ -688,6 +688,31 @@ class Checkpointer:
         # keys: the storage reader renames checkpoint keys in metadata, and then to_hf also
         # renames model keys, producing a mismatch in the DCP planner.
         reader_key_mapping = None if has_state_dict_adapter else key_mapping
+
+        # Optional layer-chunked base-model load to cap peak memory for large MoE
+        # models. Custom-adapter models convert the model state dict to HF layout
+        # via to_hf() before DCP fills it; for MoE models to_hf() materializes a
+        # full second copy of the (EP-sharded) split-expert weights. On minimal
+        # node counts that ~2x transient OOMs at load even though the sharded
+        # steady-state model fits comfortably. Loading whole-layer chunks keeps
+        # only a few layers' split-expert copies resident at a time. Opt-in via
+        # NEMO_BASE_MODEL_LOAD_LAYER_CHUNK (decoder layers per chunk; 0 = disabled,
+        # original monolithic behavior).
+        layer_chunk = int(os.environ.get("NEMO_BASE_MODEL_LOAD_LAYER_CHUNK", "0"))
+        if is_init_step and has_state_dict_adapter and layer_chunk > 0:
+            self._load_base_model_in_layer_chunks(
+                model_state,
+                state_dict,
+                expected_keys,
+                model_path,
+                reader_key_mapping,
+                layer_chunk,
+                is_safetensors=is_safetensors,
+            )
+            del state_dict
+            gc.collect()
+            return
+
         storage_reader = self._get_storage_reader(
             model_path, reader_key_mapping, is_init_step=is_init_step, is_safetensors=is_safetensors
         )
@@ -807,6 +832,137 @@ class Checkpointer:
 
         del state_dict
         gc.collect()
+
+    def _load_base_model_in_layer_chunks(
+        self,
+        model_state: ModelState,
+        state_dict: dict[str, torch.Tensor],
+        expected_keys: set[str],
+        model_path: str,
+        reader_key_mapping: Optional[dict[str, str]],
+        layer_chunk: int,
+        is_safetensors: bool | None = None,
+    ) -> None:
+        """Load a base checkpoint into a custom-adapter model in whole-layer chunks.
+
+        Performs the same ``to_hf -> dcp.load -> from_hf -> load_state_dict`` cycle
+        as the monolithic path, but over groups of ``layer_chunk`` decoder layers at
+        a time so that the split-expert tensors materialized by ``to_hf`` (a full
+        second copy of the EP-sharded expert weights for MoE models) are only
+        resident for a few layers at once. Non-layer keys (embeddings, final norm,
+        lm_head, etc.) are loaded together as the first chunk, which also carries the
+        tied-lm-head compatibility handling.
+
+        Args:
+            model_state: Wrapped single model part to load into.
+            state_dict: Native-format model state dict (references to model params).
+            expected_keys: Native keys expected after load, for the key-diff summary.
+            model_path: Checkpoint directory or HF snapshot path.
+            reader_key_mapping: Key mapping for the storage reader (None for adapters).
+            layer_chunk: Number of decoder layers per chunk.
+            is_safetensors: Whether ``model_path`` holds a safetensors checkpoint;
+                forwarded to ``_get_storage_reader`` (computed from the directory
+                contents when not supplied).
+        """
+
+        def _layer_index(key: str) -> Optional[int]:
+            marker = ".layers."
+            i = key.find(marker)
+            if i == -1:
+                return None
+            num = key[i + len(marker) :].split(".", 1)[0]
+            return int(num) if num.isdigit() else None
+
+        model = model_state.model[0]
+
+        # Partition keys: non-layer keys form the first chunk; layer keys are
+        # grouped into consecutive runs of `layer_chunk` whole layers.
+        misc_keys: list[str] = []
+        layer_to_keys: dict[int, list[str]] = {}
+        for k in state_dict:
+            li = _layer_index(k)
+            if li is None:
+                misc_keys.append(k)
+            else:
+                layer_to_keys.setdefault(li, []).append(k)
+
+        chunks: list[list[str]] = []
+        if misc_keys:
+            chunks.append(misc_keys)
+        sorted_layers = sorted(layer_to_keys)
+        for i in range(0, len(sorted_layers), layer_chunk):
+            chunks.append([k for layer in sorted_layers[i : i + layer_chunk] for k in layer_to_keys[layer]])
+
+        lm_head_param_name = getattr(model_state, "lm_head_param_name", None)
+        uses_tied_lm_head = getattr(model_state, "uses_tied_lm_head", False)
+        has_local_tied_lm_head = getattr(model_state, "has_local_tied_lm_head", False)
+
+        loaded_keys: set[str] = set()
+        for chunk_idx, chunk_keys in enumerate(chunks):
+            sub_sd = {k: state_dict[k] for k in chunk_keys}
+            sub_sd = _maybe_adapt_state_dict_to_hf(
+                model,
+                sub_sd,
+                quantization=self.config.dequantize_base_checkpoint,
+                device_mesh=self.moe_mesh,
+            )
+
+            # A fresh reader per chunk; dcp.load only reads the requested keys.
+            storage_reader = self._get_storage_reader(
+                model_path, reader_key_mapping, is_init_step=True, is_safetensors=is_safetensors
+            )
+
+            # Tied-lm-head compat only applies to the chunk that carries lm_head.
+            compat_tied_lm_head_source_key: Optional[str] = None
+            if (
+                uses_tied_lm_head
+                and not has_local_tied_lm_head
+                and isinstance(lm_head_param_name, str)
+                and lm_head_param_name in sub_sd
+            ):
+                checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+                if lm_head_param_name not in checkpoint_metadata_keys:
+                    for source_name in get_tied_lm_head_source_names(model, lm_head_param_name):
+                        if source_name not in checkpoint_metadata_keys or source_name in sub_sd:
+                            continue
+                        compat_tied_lm_head_source_key = source_name
+                        sub_sd[source_name] = sub_sd.pop(lm_head_param_name)
+                        logging.warning(
+                            "Checkpoint %s is missing %s. Loading tied source %s into lm_head.",
+                            model_path,
+                            lm_head_param_name,
+                            source_name,
+                        )
+                        break
+                    if compat_tied_lm_head_source_key is None:
+                        sub_sd.pop(lm_head_param_name, None)
+
+            sub_sd = self._do_load(sub_sd, model_path, storage_reader, is_init_step=True)
+
+            if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
+                sub_sd[lm_head_param_name] = sub_sd.pop(compat_tied_lm_head_source_key)
+
+            sub_sd = _maybe_adapt_state_dict_from_hf(model, sub_sd, moe_mesh=self.moe_mesh)
+            loaded_keys.update(sub_sd.keys())
+            model_state.load_state_dict(sub_sd, strict=False)
+
+            del sub_sd, storage_reader
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logging.info("load_model: loaded base-weight chunk %d/%d", chunk_idx + 1, len(chunks))
+
+        key_diff = _summarize_state_dict_key_diff(expected_keys, loaded_keys)
+        if key_diff["missing_count"] or key_diff["unexpected_count"]:
+            logging.warning(
+                "Checkpoint key mismatch for %s: missing=%d unexpected=%d "
+                "(missing examples=%s, unexpected examples=%s)",
+                type(model).__name__,
+                key_diff["missing_count"],
+                key_diff["unexpected_count"],
+                key_diff["missing_examples"],
+                key_diff["unexpected_examples"],
+            )
 
     @staticmethod
     def initialize_model_weights(
