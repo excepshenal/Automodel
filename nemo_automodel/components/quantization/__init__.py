@@ -17,7 +17,6 @@ from .qlora import (
     create_bnb_config,
     verify_qlora_quantization,
 )
-from .quant_codec import QuantExpertCodec
 
 if HAVE_TORCHAO:
     from torchao.float8 import Float8LinearConfig
@@ -38,7 +37,6 @@ __all__ = [
     "MXFP4GroupedMM",
     "dequantize_mxfp4",
     "quantize_mxfp4",
-    "QuantExpertCodec",
 ]
 
 if HAVE_TORCHAO:

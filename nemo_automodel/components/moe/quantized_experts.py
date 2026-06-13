@@ -62,8 +62,7 @@ class MXFP4ExpertStorageMixin:
     """
 
     _MXFP4_BASE_NAMES: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
-    # Storage-parameter suffixes, in pack/unpack order. Mirrors a codec's
-    # ``param_names`` (see ``quant_codec.QuantExpertCodec``); kept here so the
+    # Storage-parameter suffixes, in pack/unpack order. Kept as a tuple so the
     # registration helper is format-driven rather than hardcoding two names.
     _PACKED_SUFFIXES: tuple[str, ...] = ("_packed", "_scales")
 
