@@ -77,6 +77,9 @@ NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 RDZV_ENDPOINT="${RDZV_ENDPOINT:-127.0.0.1:29500}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+# Recipe config to launch. Default = bf16 LoRA; set to the mxfp4-resident recipe
+# (deepseek_v4_flash_hellaswag_lora_mxfp4.yaml) for the mxfp4 dequant experiment.
+CONFIG_YAML="${CONFIG_YAML:-examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_lora.yaml}"
 
 # --- preflight on the host ---------------------------------------------------
 [[ -d "$REPO_DIR" ]] || { echo "FATAL: REPO_DIR not found: $REPO_DIR" >&2; exit 1; }
@@ -127,7 +130,7 @@ exec torchrun \\
     --master-addr=${RDZV_ENDPOINT%:*} \\
     --master-port=${RDZV_ENDPOINT#*:} \\
     -m nemo_automodel.cli.app \\
-    examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_lora.yaml \\
+    $CONFIG_YAML \\
     --model.config.pretrained_model_name_or_path $MODEL_PATH \\
     --model.config.name_or_path $MODEL_PATH \\
     $LAYER_OVERRIDE \\
