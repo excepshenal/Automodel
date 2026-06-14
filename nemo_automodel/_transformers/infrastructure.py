@@ -113,7 +113,11 @@ def _apply_peft_and_lower_precision(
 
             # Put the state-dict adapter(s) in passthrough mode BEFORE the checkpoint
             # load so both to_hf (destination keys) and from_hf (aggregation) keep
-            # experts packed.
+            # experts packed. Both frozen (convert_frozen_experts_to_mxfp4 passthrough)
+            # and LoRA-targeted experts (GroupedExperts*LoRAMXFP4 built passthrough in
+            # apply_lora_to_linear_modules) load the packed fp4 keys straight into packed
+            # params — no bf16 expert materialization, so the load-time _aggregate_experts
+            # bf16 re-stack OOM is avoided.
             for part in getattr(model, "parts", [model]):
                 adapter = getattr(part, "state_dict_adapter", None)
                 if adapter is not None and hasattr(adapter, "expert_storage_format"):
