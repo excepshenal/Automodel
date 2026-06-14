@@ -25,6 +25,7 @@ from torch.distributed.tensor.placement_types import Shard as _Shard
 
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
+    GroupedExpertsDeepEPLoRAMXFP4,
     GroupedExpertsLoRA,
     GroupedExpertsLoRAMXFP4,
 )
@@ -492,9 +493,8 @@ def patch_moe_module(
     if isinstance(orig_module, GroupedExpertsTE):
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
-        if expert_weight_format == "mxfp4":
-            raise NotImplementedError("expert_weight_format='mxfp4' is not supported for DeepEP expert modules yet.")
-        new_module = GroupedExpertsDeepEPLoRA(
+        deepep_lora_cls = GroupedExpertsDeepEPLoRAMXFP4 if expert_weight_format == "mxfp4" else GroupedExpertsDeepEPLoRA
+        new_module = deepep_lora_cls(
             orig_module,
             lora_dim=dim,
             alpha=alpha,
@@ -654,6 +654,15 @@ def convert_frozen_experts_to_mxfp4(model: nn.Module, passthrough: bool = False)
     """
     # Import here to avoid a hard dependency at module import time.
     from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
+    from nemo_automodel.components.moe.quantized_experts import GroupedExpertsDeepEPMXFP4
+
+    # Exact-type → mxfp4-resident replacement. Exact `type(...) is` (not isinstance) so the
+    # LoRA-on-experts subclasses (already MXFP4ExpertStorageMixin, skipped above) and any
+    # bf16 LoRA experts are left untouched — only genuinely frozen modules are converted.
+    frozen_conversions = {
+        GroupedExperts: GroupedExpertsMXFP4,
+        GroupedExpertsDeepEP: GroupedExpertsDeepEPMXFP4,
+    }
 
     num_converted = 0
     unsupported = 0
@@ -661,11 +670,12 @@ def convert_frozen_experts_to_mxfp4(model: nn.Module, passthrough: bool = False)
         # Already mxfp4-resident (frozen or LoRA-targeted) — skip.
         if isinstance(module, MXFP4ExpertStorageMixin):
             continue
-        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE)):
+        if isinstance(module, GroupedExpertsTE):
             unsupported += 1
             continue
-        if type(module) is GroupedExperts:
-            new_module = GroupedExpertsMXFP4(module, passthrough=passthrough)
+        new_cls = frozen_conversions.get(type(module))
+        if new_cls is not None:
+            new_module = new_cls(module, passthrough=passthrough)
             parent_name, _, child_name = name.rpartition(".")
             parent = model.get_submodule(parent_name) if parent_name else model
             setattr(parent, child_name, new_module)
@@ -673,8 +683,8 @@ def convert_frozen_experts_to_mxfp4(model: nn.Module, passthrough: bool = False)
 
     if unsupported:
         logger.warning(
-            "expert_weight_format='mxfp4' skipped %d DeepEP/TE expert module(s); only the torch_mm "
-            "GroupedExperts backend is supported. Set backend.dispatcher='torch' and backend.experts='torch_mm'.",
+            "expert_weight_format='mxfp4' skipped %d Transformer Engine expert module(s); TE experts have no "
+            "packed variant. Use backend.experts='torch_mm' (with backend.dispatcher='torch' or 'deepep').",
             unsupported,
         )
     return num_converted
