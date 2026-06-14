@@ -78,7 +78,13 @@ class DeepseekV4CausalLMOutput:
     """Output of DeepseekV4ForCausalLM.forward.
 
     Attributes:
-        logits: ``[B, S, vocab_size]`` next-token prediction logits.
+        logits: ``[B, S, vocab_size]`` next-token prediction logits. When the forward is
+            called with ``logits_to_keep > 0`` only the last ``logits_to_keep`` positions
+            are projected, so the full ``[B, S, vocab]`` tensor is never materialized.
+        hidden_states: ``[B, S, hidden]`` final hidden states (post hyper-connection head,
+            pre lm_head). Provided so a fused linear cross-entropy
+            (``FusedLinearCrossEntropy``) can apply the lm_head + CE without materializing
+            full logits.
         mtp_per_depth_h: Per-depth MTP hidden states (training mode only).
             List of length ``num_nextn_predict_layers``, each ``[B, S, hidden]``.
             ``None`` when MTP is disabled or in eval mode.
@@ -86,8 +92,14 @@ class DeepseekV4CausalLMOutput:
     """
 
     logits: torch.Tensor
+    hidden_states: torch.Tensor | None = None
     mtp_per_depth_h: list[torch.Tensor] | None = None
     mtp_loss_scaling_factor: float = 0.1
+
+    def __contains__(self, key: str) -> bool:
+        # The training loop probes ``"hidden_states" in out`` to select the fused
+        # linear-CE path; support membership tests over the populated fields.
+        return getattr(self, key, None) is not None
 
 
 class DeepseekV4Block(nn.Module):
@@ -743,6 +755,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: int = 0,
         **attn_kwargs: Any,
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
         is_pp_stage = self._is_pipeline_parallel_stage()
@@ -766,7 +779,11 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             mtp_hc_hidden = None
         if self.lm_head:
             hidden_dtype = hidden_states.dtype
-            logits = self.lm_head(hidden_states.float()).to(hidden_dtype)
+            # Only project the last `logits_to_keep` positions when requested (fused
+            # linear-CE / generation), so the full [B, S, vocab] logits are never
+            # materialized; the full hidden_states are returned for the fused loss.
+            lm_in = hidden_states[:, -logits_to_keep:, :] if logits_to_keep > 0 else hidden_states
+            logits = self.lm_head(lm_in.float()).to(hidden_dtype)
         else:
             logits = hidden_states
         if thd_mode and logits.dim() == 2:
@@ -820,6 +837,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         return DeepseekV4CausalLMOutput(
             logits=logits,
+            hidden_states=hidden_states,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
         )
