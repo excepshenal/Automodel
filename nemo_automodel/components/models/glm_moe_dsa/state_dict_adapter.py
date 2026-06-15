@@ -34,6 +34,13 @@ class GlmMoeDsaStateDictAdapter(Glm4MoeStateDictAdapter):
     ]
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        # int4-resident experts: defer to the base adapter, which splits the resident packed
+        # params into per-expert AutoGPTQ destination placeholders (quantization=True) or resident
+        # per-expert keys. The DSA indexer / MLA attention weights are bf16 in this mode (the int4
+        # checkpoint's int8 attention is dequantized on load), so the FP8 cast below does not apply.
+        if self.expert_storage_format == "int4":
+            return super().convert_single_tensor_to_hf(fqn, tensor, **kwargs)
+
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 

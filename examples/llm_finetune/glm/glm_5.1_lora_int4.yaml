@@ -1,0 +1,151 @@
+# LoRA fine-tuning of the GLM-5.1 mixed-precision int4 checkpoint (INC4AI / auto-round,
+# packing format auto_round:auto_gptq) on HellaSwag.
+#
+# GLM-5.1 maps to GlmMoeDsaForCausalLM (DeepSeek-style MLA + DSA sparse-attention indexer +
+# 256-expert MoE, first_k_dense_replace=3). The published int4 checkpoint is mixed-bit: routed
+# experts are int4 while MLA attention and the shared experts are int8.
+#
+# On load the GlmMoeDsaStateDictAdapter (int4 mode) transcodes the int4 routed experts straight
+# into resident packed storage (group-128 symmetric W4A16, dequantized on the fly in the
+# grouped-GEMM forward/backward) and dequantizes the int8 attention + shared experts to bf16.
+# The router gate, norms, first-3 dense MLPs, embeddings, and lm_head stay bf16. Only the LoRA
+# adapters train; every base weight is frozen (routed experts -> GroupedExpertsLoRAInt4 with a
+# packed base + bf16 adapter; attention / shared experts are bf16 LoRA).
+#
+# Requirements / status:
+#   - Needs the INC4AI mixed-int4 GLM-5.1 checkpoint; set --model.pretrained_model_name_or_path
+#     to a local copy (its config.json carries the quantization_config the adapter reads).
+#   - int4-resident experts require backend.experts: torch_mm.
+#   - peft.expert_weight_format=int4 requires expert parallelism (ep_size > 1).
+#   - The int4 routed-expert DCP load path (to_hf AutoGPTQ destinations -> from_hf transcode)
+#     and the int4 EP forward/backward are validated. The int8 (non-expert) MLA-attention /
+#     shared-expert weights load correctly via the full-state path; multi-GPU DCP straight-copy
+#     of those int8 AutoGPTQ tensors under FSDP row-sharding still needs storage-reader dequant.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 512
+  local_batch_size: 8
+  ckpt_every_steps: 500
+  val_every_steps: 100
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  # INC4AI mixed-int4 (auto-round) GLM-5.1 checkpoint (local path recommended for offline runs).
+  pretrained_model_name_or_path: /raid0/data/models/GLM-5.1-int4-AutoRound
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    # int4 experts run on the torch_mm grouped-GEMM path (DeepEP dispatch supported on top of it).
+    dispatcher: deepep
+    experts: torch_mm
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    # MLA attention (int8 base -> dequantized to bf16 on load; bf16 LoRA adapters)
+    - "*q_a_proj"
+    - "*q_b_proj"
+    - "*kv_a_proj_with_mqa"
+    - "*kv_b_proj"
+    - "*self_attn.o_proj"
+    # routed experts: GroupedExperts -> GroupedExpertsLoRAInt4 (frozen base stays int4-packed)
+    - "*mlp.experts"
+    # shared experts (int8 base -> bf16 on load; bf16 LoRA adapters)
+    - "*shared_experts.gate_proj"
+    - "*shared_experts.up_proj"
+    - "*shared_experts.down_proj"
+  dim: 8
+  alpha: 32
+  use_triton: true
+  lora_dtype: float32
+  # Keep the frozen routed experts packed as int4 and dequantize on the fly.
+  expert_weight_format: int4
+
+checkpoint:
+  enabled: false
+  # The INC4AI checkpoint's int4 experts are transcoded (not dequantized) into resident packed
+  # storage; the int8 attention/shared weights are dequantized to bf16. quantization=True drives
+  # to_hf to emit the int4 AutoGPTQ load destinations for the routed experts.
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  # ep_size must divide world_size; > 1 is required for int4 packed experts.
+  ep_size: 32
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: up
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+
+  moe:
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+  split_across_pack: false
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  shuffle: true
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  batch_size: 8
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.0
