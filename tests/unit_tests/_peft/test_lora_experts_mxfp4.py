@@ -128,7 +128,7 @@ def test_mxfp4_module_packs_base_weights(moe_config, device):
 
     lora = GroupedExpertsLoRAMXFP4(orig, lora_dim=8, alpha=16)
 
-    assert lora._mxfp4_resident
+    assert lora._packed_resident
     assert not hasattr(lora, "gate_and_up_projs")
     assert not hasattr(lora, "down_projs")
     assert lora.gate_and_up_projs_packed.dtype == torch.int8
@@ -227,7 +227,7 @@ def test_frozen_mxfp4_packs_and_freezes(moe_config, device):
         orig.init_weights(buffer_device=device)
 
     mx = GroupedExpertsMXFP4(orig)
-    assert mx._mxfp4_resident
+    assert mx._packed_resident
     assert not hasattr(mx, "gate_and_up_projs")
     assert mx.gate_and_up_projs_packed.dtype == torch.int8
     assert mx.down_projs_scales.dtype == torch.float8_e8m0fnu
@@ -262,7 +262,7 @@ def test_register_packed_base_weight_is_init_capable(moe_config):
     mx = GroupedExpertsMXFP4.__new__(GroupedExpertsMXFP4)
     GroupedExperts.__init__(mx, moe_config, backend=None)
     mx.use_torch_mm = True
-    mx._mxfp4_resident = False
+    mx._packed_resident = False
 
     # Register meta placeholders of the packed shapes, as a chunk-loader would at init.
     e = moe_config.n_routed_experts
@@ -295,7 +295,7 @@ def test_passthrough_init_registers_packed_params_on_meta(moe_config):
 
     mx = GroupedExpertsMXFP4(orig, passthrough=True)
 
-    assert mx._mxfp4_resident
+    assert mx._packed_resident
     assert not hasattr(mx, "gate_and_up_projs")  # never created bf16 storage
     up_proj_dim = 2 * moe_config.moe_inter_dim  # gated
     assert tuple(mx.gate_and_up_projs_packed.shape) == (moe_config.n_routed_experts, up_proj_dim, moe_config.dim // 2)
@@ -322,7 +322,7 @@ def test_lora_passthrough_init_packed_base_with_trainable_adapters(moe_config):
         orig.use_torch_mm = True
         mx = GroupedExpertsLoRAMXFP4(orig, lora_dim=8, alpha=16, passthrough=True)
 
-    assert mx._mxfp4_resident
+    assert mx._packed_resident
     assert not hasattr(mx, "gate_and_up_projs")  # base is packed, never bf16
     assert mx.gate_and_up_projs_packed.dtype == torch.int8
     assert mx.gate_and_up_projs_packed.is_meta

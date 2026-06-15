@@ -32,8 +32,9 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
-    _apply_bias,
-    _permute_tokens_for_grouped_mm,
+    _PackedGroupedExpertsDeepEPForward,
+    _PackedGroupedExpertsForward,
+    _to_local,
 )
 from nemo_automodel.components.quantization.mxfp4 import (
     MXFP4_BLOCK_SIZE,
@@ -41,11 +42,6 @@ from nemo_automodel.components.quantization.mxfp4 import (
     dequantize_mxfp4,
     quantize_mxfp4,
 )
-
-
-def _to_local(t):
-    """Return the local shard of a DTensor, or the tensor unchanged."""
-    return t.to_local() if isinstance(t, DTensor) else t
 
 
 class MXFP4ExpertStorageMixin:
@@ -75,7 +71,7 @@ class MXFP4ExpertStorageMixin:
                 "The grouped_gemm path (backend.experts='gmm') has no packed variant; with DeepEP dispatch use "
                 "backend.dispatcher='deepep' together with backend.experts='torch_mm'."
             )
-        self._mxfp4_resident = False
+        self._packed_resident = False
         if not _to_local(getattr(self, self._MXFP4_BASE_NAMES[0])).is_meta:
             self.pack_base_weights()
 
@@ -106,7 +102,7 @@ class MXFP4ExpertStorageMixin:
             packed = torch.empty(packed_shape, dtype=torch.int8, device="meta")
             scales = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device="meta")
             self.register_packed_base_weight(name, (packed, scales))
-        self._mxfp4_resident = True
+        self._packed_resident = True
 
     @torch.no_grad()
     def register_packed_base_weight(self, name: str, tensors: tuple[torch.Tensor, ...], reference=None) -> None:
@@ -141,7 +137,7 @@ class MXFP4ExpertStorageMixin:
 
         No-op when already packed. Requires the base weights to be materialized.
         """
-        if self._mxfp4_resident:
+        if self._packed_resident:
             return
         for name in self._MXFP4_BASE_NAMES:
             param = getattr(self, name)
@@ -151,27 +147,27 @@ class MXFP4ExpertStorageMixin:
             # mx block scales run along the contraction dim.
             tensors = quantize_mxfp4(local.transpose(-2, -1).contiguous())
             self.register_packed_base_weight(name, tensors, reference=param)
-        self._mxfp4_resident = True
+        self._packed_resident = True
 
-    def _mxfp4_base_mm(self, x: torch.Tensor, name: str, offs: torch.Tensor) -> torch.Tensor:
+    def _base_mm(self, x: torch.Tensor, name: str, offs: torch.Tensor) -> torch.Tensor:
         """Grouped GEMM ``x @ W`` over the packed base weight ``name`` (dequant on the fly)."""
         packed = _to_local(getattr(self, name + "_packed"))
         scales = _to_local(getattr(self, name + "_scales"))
         return MXFP4GroupedMM.apply(x, packed, scales, offs)
 
-    def _mxfp4_dequant_expert0(self, name: str, dtype: torch.dtype) -> torch.Tensor:
+    def _dequant_expert0(self, name: str, dtype: torch.dtype) -> torch.Tensor:
         """Dequantize expert 0 of base weight ``name`` to compute layout ``[in, out]``."""
         packed = _to_local(getattr(self, name + "_packed"))[0]
         scales = _to_local(getattr(self, name + "_scales"))[0]
         return dequantize_mxfp4(packed, scales, dtype).transpose(-2, -1)
 
 
-class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
+class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, _PackedGroupedExpertsForward, GroupedExperts):
     """Frozen routed experts with mxfp4-resident base weights and no adapter.
 
     Drop-in replacement for ``GroupedExperts`` when the experts are frozen (e.g.
-    LoRA training that targets only attention). Forward mirrors
-    ``GroupedExperts._forward_grouped_mm`` but reads the packed base weights.
+    LoRA training that targets only attention). The codec-agnostic forward lives in
+    ``_PackedGroupedExpertsForward``; only the mxfp4 storage and ``__init__`` are here.
     """
 
     def __init__(self, orig_module: GroupedExperts, passthrough: bool = False):
@@ -211,91 +207,8 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
         self.down_projs.requires_grad_(False)
         self._init_mxfp4_storage()
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        token_mask: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Forward over mxfp4 base weights. Falls back to bf16 until packing is done."""
-        if not self._mxfp4_resident:
-            return super().forward(x, token_mask, weights, indices)
 
-        assert not isinstance(x, DTensor)
-        input_dtype = x.dtype
-
-        if isinstance(self.gate_and_up_projs_packed, DTensor):
-            ep_mesh = self.gate_and_up_projs_packed.device_mesh
-            assert ep_mesh is not None and ep_mesh.ndim == 1, "We only support 1D mesh for MoE"
-            ep_size = ep_mesh.size()
-            ep_rank = ep_mesh.get_local_rank()
-        else:
-            ep_mesh = None
-            ep_size = 1
-            ep_rank = 0
-
-        assert self.n_routed_experts % ep_size == 0
-
-        if ep_size > 1:
-            from torch.distributed.tensor import Partial, Shard
-
-            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-
-        n_local_experts = self.n_routed_experts // ep_size
-        experts_start_idx = ep_rank * n_local_experts
-
-        y = self._forward_grouped_mm_mxfp4(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
-
-        if ep_size > 1:
-            from torch.distributed.tensor import Partial, Shard
-
-            y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
-            y = y.redistribute(placements=[Shard(0)]).to_local()
-
-        return y.to(input_dtype)
-
-    def _forward_grouped_mm_mxfp4(self, x, token_mask, weights, indices, n_local_experts, experts_start_idx):
-        sorted_token_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
-            indices, weights, token_mask, n_local_experts, experts_start_idx
-        )
-        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-
-        if tokens_per_expert.sum() > 0:
-            permuted_x = x[sorted_token_ids]
-            permuted_probs = sorted_weights.unsqueeze(-1)
-
-            output1 = self._mxfp4_base_mm(permuted_x, "gate_and_up_projs", offs)
-            if self.expert_bias:
-                output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
-            output1 = self.expert_activation_grouped(output1, permuted_probs)
-
-            output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
-            if self.expert_bias:
-                output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
-
-            scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-            y.scatter_add_(0, scatter_ids, output2.float())
-        else:
-            # Dummy computation for gradient flow when no tokens routed locally.
-            gate_up_w0 = self._mxfp4_dequant_expert0("gate_and_up_projs", x.dtype)
-            down_w0 = self._mxfp4_dequant_expert0("down_projs", x.dtype)
-            output1 = torch.matmul(x[0] * 0, gate_up_w0)
-            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
-            output2 = torch.matmul(output1_, down_w0)
-            y[0] += output2[0]
-
-        return y
-
-
-class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
+class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, _PackedGroupedExpertsDeepEPForward, GroupedExpertsDeepEP):
     """Frozen routed experts with mxfp4-resident base weights under DeepEP dispatch.
 
     Drop-in replacement for ``GroupedExpertsDeepEP`` when the experts are frozen
@@ -342,56 +255,3 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
         self.gate_and_up_projs.requires_grad_(False)
         self.down_projs.requires_grad_(False)
         self._init_mxfp4_storage()
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        token_mask: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Forward over mxfp4 base weights with DeepEP dispatch.
-
-        Mirrors ``GroupedExpertsDeepEP.forward``, replacing the two base
-        ``torch._grouped_mm`` calls with ``MXFP4GroupedMM`` over the packed weights.
-        Falls back to the bf16 parent while packing is still deferred.
-        """
-        if not self._mxfp4_resident:
-            return super().forward(x, token_mask, weights, indices)
-
-        assert not isinstance(x, DTensor)
-        assert self.use_torch_mm, "mxfp4-resident DeepEP experts require the torch_mm experts backend."
-        assert self.n_routed_experts % self.ep_size == 0, (
-            f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
-        )
-
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
-            hidden_states=x,
-            num_local_tokens=x.size(0),
-            token_probs=weights,
-            token_indices=indices,
-        )
-        permuted_probs = permuted_probs.unsqueeze(-1)
-
-        if torch.count_nonzero(tokens_per_expert) > 0:
-            tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
-            offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
-
-            output1 = self._mxfp4_base_mm(permuted_local_hidden_states, "gate_and_up_projs", offs)
-            if self.expert_bias:
-                output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
-            output1 = self.expert_activation(output1, permuted_probs)
-            output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
-            if self.expert_bias:
-                output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
-        else:
-            # Dummy computation for gradient flow when no tokens routed locally.
-            gate_up_w0 = self._mxfp4_dequant_expert0("gate_and_up_projs", x.dtype)
-            down_w0 = self._mxfp4_dequant_expert0("down_projs", x.dtype)
-            output1 = torch.matmul(x[0] * 0, gate_up_w0)
-            output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, down_w0)
-
-        y = self.token_dispatcher.token_unpermutation(output2)
-        return y

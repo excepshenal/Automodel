@@ -94,7 +94,7 @@ def test_int4_module_packs_base_weights(moe_config, device):
 
     lora = GroupedExpertsLoRAInt4(orig, lora_dim=8, alpha=16)
 
-    assert lora._int4_resident
+    assert lora._packed_resident
     assert not hasattr(lora, "gate_and_up_projs")
     assert not hasattr(lora, "down_projs")
     assert lora.gate_and_up_projs_packed.dtype == torch.int32
@@ -184,7 +184,7 @@ def test_frozen_int4_packs_and_freezes(moe_config, device):
         orig.init_weights(buffer_device=device)
 
     q = GroupedExpertsInt4(orig)
-    assert q._int4_resident
+    assert q._packed_resident
     assert not hasattr(q, "gate_and_up_projs")
     assert q.gate_and_up_projs_packed.dtype == torch.int32
     assert q.down_projs_scales.dtype == torch.bfloat16

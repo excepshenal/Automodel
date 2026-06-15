@@ -782,7 +782,7 @@ def pack_mxfp4_expert_base_weights(model: nn.Module) -> int:
     """
     num_packed = 0
     for module in model.modules():
-        if isinstance(module, MXFP4ExpertStorageMixin) and not module._mxfp4_resident:
+        if isinstance(module, MXFP4ExpertStorageMixin) and not module._packed_resident:
             module.pack_base_weights()
             num_packed += 1
     return num_packed
@@ -856,7 +856,7 @@ def pack_int4_expert_base_weights(model: nn.Module) -> int:
     """
     num_packed = 0
     for module in model.modules():
-        if isinstance(module, Int4ExpertStorageMixin) and not module._int4_resident:
+        if isinstance(module, Int4ExpertStorageMixin) and not module._packed_resident:
             module.pack_base_weights()
             num_packed += 1
     return num_packed

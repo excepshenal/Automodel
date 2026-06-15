@@ -119,7 +119,7 @@ def test_frozen_deepep_mxfp4_packs_and_freezes(moe_config, device):
     orig = _make_deepep(moe_config, device)
     mx = GroupedExpertsDeepEPMXFP4(orig)
 
-    assert mx._mxfp4_resident
+    assert mx._packed_resident
     assert not hasattr(mx, "gate_and_up_projs")
     assert not hasattr(mx, "down_projs")
     assert mx.gate_and_up_projs_packed.dtype == torch.int8
@@ -138,7 +138,7 @@ def test_lora_deepep_mxfp4_only_lora_trainable(moe_config, device):
     orig = _make_deepep(moe_config, device)
     mx = GroupedExpertsDeepEPLoRAMXFP4(orig, lora_dim=8, alpha=16)
 
-    assert mx._mxfp4_resident
+    assert mx._packed_resident
     assert not hasattr(mx, "gate_and_up_projs")
     assert mx.gate_and_up_projs_packed.dtype == torch.int8
     trainable = {n for n, p in mx.named_parameters() if p.requires_grad}
@@ -172,7 +172,7 @@ def test_passthrough_deepep_registers_packed_params_on_meta(moe_config):
     orig.use_torch_mm = True
 
     mx = GroupedExpertsDeepEPMXFP4(orig, passthrough=True)
-    assert mx._mxfp4_resident
+    assert mx._packed_resident
     assert not hasattr(mx, "gate_and_up_projs")  # never created bf16 storage
     up_proj_dim = 2 * moe_config.moe_inter_dim  # gated
     assert tuple(mx.gate_and_up_projs_packed.shape) == (moe_config.n_routed_experts, up_proj_dim, moe_config.dim // 2)

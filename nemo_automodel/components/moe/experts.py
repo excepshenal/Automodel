@@ -97,6 +97,11 @@ def is_gated_activation(activation: str) -> bool:
     return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
 
 
+def _to_local(t):
+    """Return the local shard of a DTensor, or the tensor unchanged."""
+    return t.to_local() if isinstance(t, DTensor) else t
+
+
 def _permute_tokens_for_grouped_mm(
     indices: torch.Tensor,
     weights: torch.Tensor,
@@ -872,6 +877,157 @@ class GroupedExpertsDeepEP(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
+class _PackedGroupedExpertsForward:
+    """Shared forward for frozen packed-quantized routed experts (torch grouped GEMM).
+
+    Mixed into a concrete class that also inherits a packed-storage mixin (which provides
+    ``_packed_resident``, ``_base_mm`` and ``_dequant_expert0``) and ``GroupedExperts``. The
+    forward is codec-agnostic: the int4 and mxfp4 variants differ only in those storage
+    primitives, so the body lives here once and the ``GroupedExpertsInt4`` / ``GroupedExpertsMXFP4``
+    classes carry only their codec-specific ``__init__`` and storage mixin.
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward over packed base weights. Falls back to bf16 until packing is done."""
+        if not self._packed_resident:
+            return super().forward(x, token_mask, weights, indices)
+
+        assert not isinstance(x, DTensor)
+        input_dtype = x.dtype
+
+        if isinstance(self.gate_and_up_projs_packed, DTensor):
+            ep_mesh = self.gate_and_up_projs_packed.device_mesh
+            assert ep_mesh is not None and ep_mesh.ndim == 1, "We only support 1D mesh for MoE"
+            ep_size = ep_mesh.size()
+            ep_rank = ep_mesh.get_local_rank()
+        else:
+            ep_mesh = None
+            ep_size = 1
+            ep_rank = 0
+
+        assert self.n_routed_experts % ep_size == 0
+
+        if ep_size > 1:
+            from torch.distributed.tensor import Partial, Shard
+
+            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
+                grad_placements=[Partial()]
+            )
+            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
+                grad_placements=[Partial()]
+            )
+            indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+            token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+
+        n_local_experts = self.n_routed_experts // ep_size
+        experts_start_idx = ep_rank * n_local_experts
+
+        y = self._forward_grouped_mm_packed(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
+
+        if ep_size > 1:
+            from torch.distributed.tensor import Partial, Shard
+
+            y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
+            y = y.redistribute(placements=[Shard(0)]).to_local()
+
+        return y.to(input_dtype)
+
+    def _forward_grouped_mm_packed(self, x, token_mask, weights, indices, n_local_experts, experts_start_idx):
+        sorted_token_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
+            indices, weights, token_mask, n_local_experts, experts_start_idx
+        )
+        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+
+        if tokens_per_expert.sum() > 0:
+            permuted_x = x[sorted_token_ids]
+            permuted_probs = sorted_weights.unsqueeze(-1)
+
+            output1 = self._base_mm(permuted_x, "gate_and_up_projs", offs)
+            if self.expert_bias:
+                output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
+            output1 = self.expert_activation_grouped(output1, permuted_probs)
+
+            output2 = self._base_mm(output1, "down_projs", offs)
+            if self.expert_bias:
+                output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
+
+            scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
+            y.scatter_add_(0, scatter_ids, output2.float())
+        else:
+            # Dummy computation for gradient flow when no tokens routed locally.
+            gate_up_w0 = self._dequant_expert0("gate_and_up_projs", x.dtype)
+            down_w0 = self._dequant_expert0("down_projs", x.dtype)
+            output1 = torch.matmul(x[0] * 0, gate_up_w0)
+            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
+            output2 = torch.matmul(output1_, down_w0)
+            y[0] += output2[0]
+
+        return y
+
+
+class _PackedGroupedExpertsDeepEPForward:
+    """Shared forward for frozen packed-quantized routed experts under DeepEP dispatch.
+
+    The DeepEP fused all-to-all token dispatch is reused unchanged from ``GroupedExpertsDeepEP``;
+    only the two post-dispatch base grouped GEMMs read the packed weights via ``_base_mm`` instead
+    of bf16 ``torch._grouped_mm``. Codec-agnostic — see ``_PackedGroupedExpertsForward``.
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward over packed base weights with DeepEP dispatch. Falls back to bf16 until packed."""
+        if not self._packed_resident:
+            return super().forward(x, token_mask, weights, indices)
+
+        assert not isinstance(x, DTensor)
+        assert self.use_torch_mm, "packed-resident DeepEP experts require the torch_mm experts backend."
+        assert self.n_routed_experts % self.ep_size == 0, (
+            f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
+        )
+
+        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
+            hidden_states=x,
+            num_local_tokens=x.size(0),
+            token_probs=weights,
+            token_indices=indices,
+        )
+        permuted_probs = permuted_probs.unsqueeze(-1)
+
+        if torch.count_nonzero(tokens_per_expert) > 0:
+            tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
+            offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
+
+            output1 = self._base_mm(permuted_local_hidden_states, "gate_and_up_projs", offs)
+            if self.expert_bias:
+                output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
+            output1 = self.expert_activation(output1, permuted_probs)
+            output2 = self._base_mm(output1, "down_projs", offs)
+            if self.expert_bias:
+                output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
+        else:
+            # Dummy computation for gradient flow when no tokens routed locally.
+            gate_up_w0 = self._dequant_expert0("gate_and_up_projs", x.dtype)
+            down_w0 = self._dequant_expert0("down_projs", x.dtype)
+            output1 = torch.matmul(x[0] * 0, gate_up_w0)
+            output1_ = self.expert_activation(output1, permuted_probs)
+            output2 = torch.matmul(output1_, down_w0)
+
+        y = self.token_dispatcher.token_unpermutation(output2)
+        return y
+
+
 def _torch_mm_experts_fwd(
     hidden_states,
     gate_and_up_projs,
@@ -1359,9 +1515,9 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         else:
             return tensor
 
-    # mxfp4-resident experts hold packed base weights (no gate_and_up_projs /
+    # Packed-resident experts (int4 / mxfp4) hold packed base weights (no gate_and_up_projs /
     # down_projs); those are filled from the checkpoint, nothing to init here.
-    if getattr(module, "_mxfp4_resident", False):
+    if getattr(module, "_packed_resident", False):
         return
 
     with torch.device(buffer_device):
