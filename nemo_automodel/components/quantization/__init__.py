@@ -6,6 +6,14 @@ from .fp8 import (
     create_fp8_config_from_dict,
     verify_fp8_conversion,
 )
+from .int4 import (
+    INT4_GROUP_SIZE,
+    Int4GroupedMM,
+    dequantize_int4,
+    pack_int4,
+    quantize_int4,
+    unpack_int4,
+)
 from .mxfp4 import (
     MXFP4_BLOCK_SIZE,
     MXFP4GroupedMM,
@@ -37,6 +45,12 @@ __all__ = [
     "MXFP4GroupedMM",
     "dequantize_mxfp4",
     "quantize_mxfp4",
+    "INT4_GROUP_SIZE",
+    "Int4GroupedMM",
+    "dequantize_int4",
+    "quantize_int4",
+    "pack_int4",
+    "unpack_int4",
 ]
 
 if HAVE_TORCHAO:
