@@ -25,8 +25,10 @@ from torch.distributed.tensor.placement_types import Shard as _Shard
 
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
+    GroupedExpertsDeepEPLoRAInt4,
     GroupedExpertsDeepEPLoRAMXFP4,
     GroupedExpertsLoRA,
+    GroupedExpertsLoRAInt4,
     GroupedExpertsLoRAMXFP4,
 )
 from nemo_automodel.components._peft.lora_kernel import (
@@ -35,6 +37,7 @@ from nemo_automodel.components._peft.lora_kernel import (
     lora_forward_wrapper,
 )
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
+from nemo_automodel.components.moe.int4_experts import GroupedExpertsInt4, Int4ExpertStorageMixin
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.quantized_experts import GroupedExpertsMXFP4, MXFP4ExpertStorageMixin
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
@@ -62,10 +65,12 @@ class PeftConfig:
     use_memory_efficient_lora: bool = True
     use_triton: bool = False
     moe_rank_scaling: bool = False
-    # "mxfp4" keeps frozen MoE expert base weights packed as fp4-e2m1 + e8m0 block
-    # scales, dequantized on the fly in forward/backward. Experts only; requires
-    # the torch_mm experts backend.
-    expert_weight_format: Literal["bf16", "mxfp4"] = "bf16"
+    # Keep frozen MoE expert base weights packed and dequantize on the fly in
+    # forward/backward (experts only; requires the torch_mm experts backend):
+    #   "mxfp4" -> fp4-e2m1 + e8m0 block scales (DeepSeek-V4 native format)
+    #   "int4"  -> symmetric W4A16 group-128 (GLM-5.1; RTN of the bf16 base, or a
+    #              losslessly-transcoded AutoGPTQ/auto-round int4 checkpoint)
+    expert_weight_format: Literal["bf16", "mxfp4", "int4"] = "bf16"
 
     def to_dict(self):
         return self.__dict__.copy()
@@ -530,29 +535,36 @@ def patch_moe_module(
         lora_A_init_method (str, optional): Initialization method for LoRA A matrix. Defaults to "xavier".
         lora_dtype (torch.dtype or str, optional): Data type for LoRA weights. Defaults to None.
         expert_weight_format (str, optional): "bf16" keeps frozen base expert weights in
-            floating point; "mxfp4" keeps them packed as fp4-e2m1 + e8m0 block scales with
-            on-the-fly dequantization. Defaults to "bf16".
-        passthrough (bool, optional): Only used with expert_weight_format="mxfp4". When True,
-            the frozen base is registered as packed placeholders at init so a packed fp4
-            checkpoint loads straight in (no bf16 expert materialization). Defaults to False.
+            floating point; "mxfp4" keeps them packed as fp4-e2m1 + e8m0 block scales and
+            "int4" as symmetric W4A16 group-128, each dequantized on the fly. Defaults to
+            "bf16".
+        passthrough (bool, optional): Only used with a packed expert_weight_format
+            ("mxfp4"/"int4"). When True, the frozen base is registered as packed placeholders
+            at init so a packed checkpoint loads straight in (no bf16 expert materialization).
+            Defaults to False.
 
     Returns:
         nn.Module: The LoRA-wrapped MoE module.
     """
-    if expert_weight_format not in ("bf16", "mxfp4"):
+    if expert_weight_format not in ("bf16", "mxfp4", "int4"):
         raise ValueError(f"Unsupported expert_weight_format: {expert_weight_format}")
     common = dict(lora_dim=dim, alpha=alpha, lora_A_init_method=lora_A_init_method, lora_dtype=lora_dtype)
-    mxfp4 = expert_weight_format == "mxfp4"
+    # Packed expert_weight_formats map to their (DeepEP, torch_mm) LoRA expert classes; bf16
+    # has no packed variant.
+    packed_lora_classes = {
+        "mxfp4": (GroupedExpertsDeepEPLoRAMXFP4, GroupedExpertsLoRAMXFP4),
+        "int4": (GroupedExpertsDeepEPLoRAInt4, GroupedExpertsLoRAInt4),
+    }.get(expert_weight_format)
     if isinstance(orig_module, GroupedExpertsTE):
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
-        if mxfp4:
-            new_module = GroupedExpertsDeepEPLoRAMXFP4(orig_module, passthrough=passthrough, **common)
+        if packed_lora_classes:
+            new_module = packed_lora_classes[0](orig_module, passthrough=passthrough, **common)
         else:
             new_module = GroupedExpertsDeepEPLoRA(orig_module, **common)
     elif isinstance(orig_module, GroupedExperts):
-        if mxfp4:
-            new_module = GroupedExpertsLoRAMXFP4(orig_module, passthrough=passthrough, **common)
+        if packed_lora_classes:
+            new_module = packed_lora_classes[1](orig_module, passthrough=passthrough, **common)
         else:
             new_module = GroupedExpertsLoRA(orig_module, **common)
     else:
@@ -640,10 +652,11 @@ def apply_lora_to_linear_modules(
                             moe_dim,
                         )
 
-                # Replace the module in the model. For mxfp4, build LoRA experts in
-                # passthrough mode (packed base placeholders) so the packed fp4 checkpoint
-                # loads straight in — matching the model-wide packed adapter mode set in
-                # _apply_peft_and_lower_precision and avoiding bf16 expert materialization.
+                # Replace the module in the model. For a packed expert_weight_format
+                # (mxfp4/int4), build LoRA experts in passthrough mode (packed base
+                # placeholders) so the packed checkpoint loads straight in — matching the
+                # model-wide packed adapter mode set in _apply_peft_and_lower_precision and
+                # avoiding bf16 expert materialization.
                 new_module = patch_moe_module(
                     module,
                     dim=moe_dim,
@@ -651,7 +664,7 @@ def apply_lora_to_linear_modules(
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
                     expert_weight_format=peft_config.expert_weight_format,
-                    passthrough=(peft_config.expert_weight_format == "mxfp4"),
+                    passthrough=(peft_config.expert_weight_format in ("mxfp4", "int4")),
                 )
 
                 # Find parent and replace
@@ -770,6 +783,80 @@ def pack_mxfp4_expert_base_weights(model: nn.Module) -> int:
     num_packed = 0
     for module in model.modules():
         if isinstance(module, MXFP4ExpertStorageMixin) and not module._mxfp4_resident:
+            module.pack_base_weights()
+            num_packed += 1
+    return num_packed
+
+
+def convert_frozen_experts_to_int4(model: nn.Module, passthrough: bool = False) -> int:
+    """Swap frozen ``GroupedExperts`` modules to int4-resident ``GroupedExpertsInt4``.
+
+    The int4 analog of ``convert_frozen_experts_to_mxfp4``. Applies to routed experts that are
+    NOT LoRA-targeted (those that received a LoRA adapter are already
+    ``GroupedExpertsLoRAInt4``). Must be called with the base weights frozen.
+
+    Args:
+        model: Model to convert in place.
+        passthrough: When True, build the new modules in packed-storage mode at init (no bf16
+            weights) so a packed/transcoded int4 checkpoint loads straight in, capping the
+            load-time peak. The state-dict adapter must also be in
+            ``expert_storage_format='int4'`` so it emits packed keys. When False, weights load
+            as bf16 and are round-to-nearest packed after load.
+
+    Returns:
+        Number of expert modules converted.
+    """
+    from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
+    from nemo_automodel.components.moe.int4_experts import GroupedExpertsDeepEPInt4
+
+    # Exact-type → int4-resident replacement. Exact `type(...)` match (not isinstance) so the
+    # LoRA-on-experts subclasses (already Int4ExpertStorageMixin, skipped below) and any bf16
+    # LoRA experts are left untouched — only genuinely frozen modules are converted.
+    frozen_conversions = {
+        GroupedExperts: GroupedExpertsInt4,
+        GroupedExpertsDeepEP: GroupedExpertsDeepEPInt4,
+    }
+
+    num_converted = 0
+    unsupported = 0
+    for name, module in list(model.named_modules()):
+        # Already int4-resident (frozen or LoRA-targeted) — skip.
+        if isinstance(module, Int4ExpertStorageMixin):
+            continue
+        if isinstance(module, GroupedExpertsTE):
+            unsupported += 1
+            continue
+        new_cls = frozen_conversions.get(type(module))
+        if new_cls is not None:
+            new_module = new_cls(module, passthrough=passthrough)
+            parent_name, _, child_name = name.rpartition(".")
+            parent = model.get_submodule(parent_name) if parent_name else model
+            setattr(parent, child_name, new_module)
+            num_converted += 1
+
+    if unsupported:
+        logger.warning(
+            "expert_weight_format='int4' skipped %d Transformer Engine expert module(s); TE experts have no "
+            "packed variant. Use backend.experts='torch_mm' (with backend.dispatcher='torch' or 'deepep').",
+            unsupported,
+        )
+    return num_converted
+
+
+def pack_int4_expert_base_weights(model: nn.Module) -> int:
+    """Pack any deferred int4-resident expert modules after base weights are loaded.
+
+    The int4 analog of ``pack_mxfp4_expert_base_weights``. Both ``GroupedExpertsLoRAInt4`` and
+    frozen ``GroupedExpertsInt4`` modules created on the meta device defer packing until their
+    base weights are materialized from the checkpoint; this round-to-nearest packs them one at
+    a time after the (bf16) checkpoint load.
+
+    Returns:
+        Number of modules packed.
+    """
+    num_packed = 0
+    for module in model.modules():
+        if isinstance(module, Int4ExpertStorageMixin) and not module._int4_resident:
             module.pack_base_weights()
             num_packed += 1
     return num_packed

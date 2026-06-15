@@ -91,42 +91,51 @@ def _apply_peft_and_lower_precision(
         # Skip freeze here - will do global freeze after checkpoint loading
         apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
 
-        # Convert frozen (non-LoRA-targeted) routed experts to mxfp4-resident storage.
-        # LoRA-targeted experts are already GroupedExpertsLoRAMXFP4 from the call above.
-        # Passthrough mode (packed-at-init + adapter emits packed keys) loads the
-        # fp4 checkpoint straight into packed params, never materializing bf16
+        # Convert frozen (non-LoRA-targeted) routed experts to packed-resident storage
+        # (mxfp4 or int4). LoRA-targeted experts are already GroupedExperts*LoRA{MXFP4,Int4}
+        # from the call above. Passthrough mode (packed-at-init + adapter emits packed keys)
+        # loads the packed checkpoint straight into packed params, never materializing bf16
         # experts — capping the load-time peak.
-        if getattr(peft_config, "expert_weight_format", "bf16") == "mxfp4":
-            from nemo_automodel.components._peft.lora import convert_frozen_experts_to_mxfp4
+        expert_weight_format = getattr(peft_config, "expert_weight_format", "bf16")
+        if expert_weight_format in ("mxfp4", "int4"):
+            from nemo_automodel.components._peft.lora import (
+                convert_frozen_experts_to_int4,
+                convert_frozen_experts_to_mxfp4,
+            )
 
-            # mxfp4-resident experts require expert parallelism: the packed scales
-            # are only loaded/applied correctly when the MoE parallelizer shards
-            # the experts (world_size>1, ep_size>1). At world_size=1 parallelization
-            # is skipped and the packed scales are not applied — the experts decode
-            # to unscaled fp4 (~100x too large), silently corrupting results. Fail
-            # loudly rather than train on garbage.
+            # Packed-resident experts require expert parallelism: the packed scales are only
+            # loaded/applied correctly when the MoE parallelizer shards the experts
+            # (world_size>1, ep_size>1). At world_size=1 parallelization is skipped and the
+            # packed scales are not applied — the experts decode to unscaled codes, silently
+            # corrupting results. Fail loudly rather than train on garbage.
             if get_world_size_safe() == 1:
                 raise ValueError(
-                    "peft.expert_weight_format='mxfp4' requires expert parallelism "
+                    f"peft.expert_weight_format='{expert_weight_format}' requires expert parallelism "
                     "(multi-GPU with distributed.ep_size>1); it is not supported on a single GPU "
                     "(the packed expert scales are not applied without the MoE parallelizer). "
                     "Use ep_size>1, or set expert_weight_format='bf16'."
                 )
 
-            # Put the state-dict adapter(s) in passthrough mode BEFORE the checkpoint
-            # load so both to_hf (destination keys) and from_hf (aggregation) keep
-            # experts packed. Both frozen (convert_frozen_experts_to_mxfp4 passthrough)
-            # and LoRA-targeted experts (GroupedExperts*LoRAMXFP4 built passthrough in
-            # apply_lora_to_linear_modules) load the packed fp4 keys straight into packed
-            # params — no bf16 expert materialization, so the load-time _aggregate_experts
-            # bf16 re-stack OOM is avoided.
+            # Put the state-dict adapter(s) in passthrough mode BEFORE the checkpoint load so
+            # both to_hf (destination keys) and from_hf (aggregation) keep experts packed. Both
+            # frozen (convert passthrough) and LoRA-targeted experts (built passthrough in
+            # apply_lora_to_linear_modules) load the packed keys straight into packed params —
+            # no bf16 expert materialization, so the load-time _aggregate_experts bf16 re-stack
+            # OOM is avoided.
             for part in getattr(model, "parts", [model]):
                 adapter = getattr(part, "state_dict_adapter", None)
                 if adapter is not None and hasattr(adapter, "expert_storage_format"):
-                    adapter.expert_storage_format = "mxfp4"
+                    adapter.expert_storage_format = expert_weight_format
 
-            num_converted = convert_frozen_experts_to_mxfp4(model, passthrough=True)
-            logger.info("Converted %d frozen expert module(s) to mxfp4-resident storage (passthrough)", num_converted)
+            convert = (
+                convert_frozen_experts_to_mxfp4 if expert_weight_format == "mxfp4" else convert_frozen_experts_to_int4
+            )
+            num_converted = convert(model, passthrough=True)
+            logger.info(
+                "Converted %d frozen expert module(s) to %s-resident storage (passthrough)",
+                num_converted,
+                expert_weight_format,
+            )
 
     # FP8
     if fp8_config is not None:
@@ -633,14 +642,20 @@ def apply_model_infrastructure(
                 if "lora_" not in name and param.requires_grad:
                     param.requires_grad_(False)
 
-    # Pack deferred mxfp4-resident expert base weights now that the checkpoint is loaded.
-    if peft_config is not None and getattr(peft_config, "expert_weight_format", "bf16") == "mxfp4":
-        from nemo_automodel.components._peft.lora import pack_mxfp4_expert_base_weights
+    # Pack deferred packed-resident expert base weights now that the checkpoint is loaded
+    # (only the non-passthrough path defers; passthrough loads straight into packed params).
+    _pack_expert_format = peft_config is not None and getattr(peft_config, "expert_weight_format", "bf16")
+    if _pack_expert_format in ("mxfp4", "int4"):
+        from nemo_automodel.components._peft.lora import (
+            pack_int4_expert_base_weights,
+            pack_mxfp4_expert_base_weights,
+        )
 
+        pack_fn = pack_mxfp4_expert_base_weights if _pack_expert_format == "mxfp4" else pack_int4_expert_base_weights
         for mp in model.parts if hasattr(model, "parts") else [model]:
-            num_packed = pack_mxfp4_expert_base_weights(mp)
+            num_packed = pack_fn(mp)
             if num_packed:
-                logger.info("Packed %d MoE expert modules to mxfp4-resident storage", num_packed)
+                logger.info("Packed %d MoE expert modules to %s-resident storage", num_packed, _pack_expert_format)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
