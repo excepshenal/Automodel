@@ -595,7 +595,7 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, _PackedGroupedExpertsLoRA
             # checkpoint then loads straight in with no bf16 expert materialization.
             self._init_packed_placeholders()
         else:
-            self._init_mxfp4_storage()
+            self._init_packed_storage()
 
 
 class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
@@ -843,7 +843,7 @@ class GroupedExpertsDeepEPLoRAMXFP4(
             # GroupedExpertsLoRAMXFP4 for the passthrough vs deferred distinction.
             self._init_packed_placeholders()
         else:
-            self._init_mxfp4_storage()
+            self._init_packed_storage()
 
 
 class GroupedExpertsLoRAInt4(Int4ExpertStorageMixin, _PackedGroupedExpertsLoRAForward, GroupedExpertsLoRA):
@@ -881,7 +881,7 @@ class GroupedExpertsLoRAInt4(Int4ExpertStorageMixin, _PackedGroupedExpertsLoRAFo
         if passthrough:
             self._init_packed_placeholders()
         else:
-            self._init_int4_storage()
+            self._init_packed_storage()
 
 
 class GroupedExpertsDeepEPLoRAInt4(
@@ -914,4 +914,4 @@ class GroupedExpertsDeepEPLoRAInt4(
         if passthrough:
             self._init_packed_placeholders()
         else:
-            self._init_int4_storage()
+            self._init_packed_storage()

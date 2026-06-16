@@ -877,6 +877,127 @@ class GroupedExpertsDeepEP(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
+class _PackedExpertStorageBase:
+    """Codec-independent packed base-weight storage for frozen routed experts.
+
+    Shared scaffolding for the int4 and mxfp4 resident-expert mixins. The frozen base
+    projections ``gate_and_up_projs`` / ``down_projs`` are replaced by two storage params each
+    (``*_packed`` codes + ``*_scales``), in checkpoint orientation ``[n_experts, out_dim,
+    in_dim]`` so the scales run along the contraction dim. The bf16 parameters are dropped once
+    packed; packing is deferred while the base weights are still on the meta device.
+
+    A codec mixin subclasses this and supplies the format-specific bits as class attributes plus
+    three small methods. The attributes are pure data (no behavior), so reading the subclass
+    tells you the full layout:
+
+    - ``_codec_label``: name used in error messages (e.g. ``"int4"``).
+    - ``_packed_dtype`` / ``_scale_dtype``: storage dtypes for the codes and scales.
+    - ``_packed_codes_per_word``: codes packed into one ``*_packed`` element along the
+      contraction dim (int4: 8 codes per int32; mxfp4: 2 e2m1 nibbles per int8).
+    - ``_packed_block``: elements per scale along the contraction dim (int4 group / mx block).
+    - ``_quantize_base(local_transposed)``: round-to-nearest quantize a materialized base in
+      checkpoint layout to ``(packed, scales)``.
+    - ``_base_mm`` / ``_dequant_expert0``: the codec grouped GEMM and expert-0 dequant. These
+      stay per-codec (kept explicit rather than dispatched) because the kernels and their
+      argument signatures differ.
+    """
+
+    _PACKED_BASE_NAMES: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
+    # Storage-parameter suffixes, in pack/unpack order. Kept as a tuple so the registration
+    # helper is format-driven rather than hardcoding two names.
+    _PACKED_SUFFIXES: tuple[str, ...] = ("_packed", "_scales")
+
+    def _init_packed_storage(self) -> None:
+        """Validate the backend and pack immediately if base weights are materialized."""
+        if not self.use_torch_mm:
+            raise NotImplementedError(
+                f"{self._codec_label}-resident expert weights require the torch_mm experts backend "
+                "(backend.experts='torch_mm'). The grouped_gemm path (backend.experts='gmm') has no packed "
+                "variant; with DeepEP dispatch use backend.dispatcher='deepep' together with "
+                "backend.experts='torch_mm'."
+            )
+        self._packed_resident = False
+        if not _to_local(getattr(self, self._PACKED_BASE_NAMES[0])).is_meta:
+            self.pack_base_weights()
+
+    @torch.no_grad()
+    def _init_packed_placeholders(self) -> None:
+        """Register meta packed storage params from config shapes (no bf16 weights).
+
+        Used by the passthrough path so a packed checkpoint loads straight into these params
+        without ever materializing bf16 experts. Config-driven, so it is shared by the torch and
+        DeepEP frozen variants.
+        """
+        cfg = self.config
+        block = self._packed_block
+        per_word = self._packed_codes_per_word
+        up_proj_dim = cfg.moe_inter_dim * 2 if self.is_gated else cfg.moe_inter_dim
+        expert_dim = cfg.expert_dim
+        moe_inter = cfg.moe_inter_dim
+        e = cfg.n_routed_experts
+        assert expert_dim % block == 0 and moe_inter % block == 0, (
+            f"expert dims must be divisible by {block} for {self._codec_label} "
+            f"(expert_dim={expert_dim}, moe_inter={moe_inter})"
+        )
+        # Checkpoint orientation [E, out, in], packed along the contraction (in) dim: per_word
+        # codes per packed element, one scale per group of `block` columns.
+        shapes = {
+            "gate_and_up_projs": ((e, up_proj_dim, expert_dim // per_word), (e, up_proj_dim, expert_dim // block)),
+            "down_projs": ((e, expert_dim, moe_inter // per_word), (e, expert_dim, moe_inter // block)),
+        }
+        for name, (packed_shape, scale_shape) in shapes.items():
+            packed = torch.empty(packed_shape, dtype=self._packed_dtype, device="meta")
+            scales = torch.empty(scale_shape, dtype=self._scale_dtype, device="meta")
+            self.register_packed_base_weight(name, (packed, scales))
+        self._packed_resident = True
+
+    @torch.no_grad()
+    def register_packed_base_weight(self, name: str, tensors: tuple[torch.Tensor, ...], reference=None) -> None:
+        """Register packed storage params for base projection ``name``.
+
+        Decoupled from quantization so it can run either as a post-load conversion
+        (``pack_base_weights`` passes freshly quantized tensors) or at module init (a chunk-loader
+        passes meta placeholders, then loads the quantized checkpoint straight into them — the
+        path that avoids ever materializing bf16 experts at scale). Replaces the bf16 parameter
+        ``name`` if present.
+
+        Args:
+            name: Base projection name (e.g. ``"gate_and_up_projs"``).
+            tensors: Storage tensors in ``_PACKED_SUFFIXES`` order.
+            reference: Optional DTensor whose mesh/placements the storage tensors inherit (use the
+                pre-pack bf16 param, or a meta DTensor at init).
+        """
+        assert len(tensors) == len(self._PACKED_SUFFIXES), (
+            f"expected {len(self._PACKED_SUFFIXES)} tensors {self._PACKED_SUFFIXES}, got {len(tensors)}"
+        )
+        if isinstance(reference, DTensor):
+            tensors = tuple(DTensor.from_local(t, reference.device_mesh, reference.placements) for t in tensors)
+        if name in self._parameters:
+            del self._parameters[name]
+        for suffix, tensor in zip(self._PACKED_SUFFIXES, tensors):
+            self.register_parameter(name + suffix, nn.Parameter(tensor, requires_grad=False))
+
+    @torch.no_grad()
+    def pack_base_weights(self) -> None:
+        """Round-to-nearest pack the frozen base projections and free the bf16 tensors.
+
+        No-op when already packed. Requires the base weights to be materialized. This is the RTN
+        path (from a bf16 base); an externally-quantized checkpoint instead loads directly into
+        the placeholders registered by ``_init_packed_placeholders``.
+        """
+        if self._packed_resident:
+            return
+        for name in self._PACKED_BASE_NAMES:
+            param = getattr(self, name)
+            local = _to_local(param)
+            assert not local.is_meta, f"pack_base_weights requires materialized '{name}'"
+            # [E, in, out] (compute layout) -> [E, out, in] (checkpoint layout) so the scales run
+            # along the contraction dim.
+            tensors = self._quantize_base(local.transpose(-2, -1).contiguous())
+            self.register_packed_base_weight(name, tensors, reference=param)
+        self._packed_resident = True
+
+
 class _PackedGroupedExpertsForward:
     """Shared forward for frozen packed-quantized routed experts (torch grouped GEMM).
 

@@ -20,18 +20,17 @@ dequantizes on the fly inside the grouped GEMM, instead of holding them in
 bf16. This is the storage win for LoRA / frozen-base training of large MoE
 models, where the routed experts dominate parameter memory.
 
-The format-specific pack/unpack/GEMM logic lives in ``MXFP4ExpertStorageMixin``
-so a future integer-int4 (e.g. GLM) variant can reuse the same module wiring by
-swapping the mixin's primitives.
+The codec-independent storage scaffolding lives in ``_PackedExpertStorageBase``
+(in ``moe/experts.py``); ``MXFP4ExpertStorageMixin`` adds only the mxfp4 codec
+primitives. The int4 variant (``moe/int4_experts.py``) shares the same base.
 """
 
 import torch
-import torch.nn as nn
-from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    _PackedExpertStorageBase,
     _PackedGroupedExpertsDeepEPForward,
     _PackedGroupedExpertsForward,
     _to_local,
@@ -44,110 +43,25 @@ from nemo_automodel.components.quantization.mxfp4 import (
 )
 
 
-class MXFP4ExpertStorageMixin:
+class MXFP4ExpertStorageMixin(_PackedExpertStorageBase):
     """Packed-mxfp4 base-weight storage and grouped GEMM for routed experts.
 
-    Mixed into a ``GroupedExperts`` (or ``GroupedExpertsLoRA``) subclass. The base
-    projections ``gate_and_up_projs`` / ``down_projs`` are stored as packed fp4
-    (int8, two e2m1 nibbles per byte) plus ``float8_e8m0fnu`` block scales, in
-    checkpoint orientation ``[n_experts, out_dim, in_dim]`` so the block scales run
-    along the contraction dim. The bf16 parameters are dropped once packed.
-
-    Packing is deferred when the base weights are still on the meta device: the
-    module behaves like its bf16 parent until ``pack_base_weights()`` runs (after
-    the checkpoint is loaded).
+    Mixed into a ``GroupedExperts`` (or ``GroupedExpertsLoRA``) subclass. The base projections are
+    stored as packed fp4 (int8, two e2m1 nibbles per byte) plus ``float8_e8m0fnu`` block scales;
+    the shared layout, registration and (de)packing scaffolding lives in
+    ``_PackedExpertStorageBase``. Only the mxfp4 codec primitives are here.
     """
 
-    _MXFP4_BASE_NAMES: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
-    # Storage-parameter suffixes, in pack/unpack order. Kept as a tuple so the
-    # registration helper is format-driven rather than hardcoding two names.
-    _PACKED_SUFFIXES: tuple[str, ...] = ("_packed", "_scales")
-
-    def _init_mxfp4_storage(self) -> None:
-        """Validate the backend and pack immediately if base weights are materialized."""
-        if not self.use_torch_mm:
-            raise NotImplementedError(
-                "mxfp4-resident expert weights require the torch_mm experts backend (backend.experts='torch_mm'). "
-                "The grouped_gemm path (backend.experts='gmm') has no packed variant; with DeepEP dispatch use "
-                "backend.dispatcher='deepep' together with backend.experts='torch_mm'."
-            )
-        self._packed_resident = False
-        if not _to_local(getattr(self, self._MXFP4_BASE_NAMES[0])).is_meta:
-            self.pack_base_weights()
+    _codec_label = "mxfp4"
+    _packed_dtype = torch.int8
+    _scale_dtype = torch.float8_e8m0fnu
+    _packed_codes_per_word = 2  # two e2m1 nibbles per int8
+    _packed_block = MXFP4_BLOCK_SIZE
 
     @torch.no_grad()
-    def _init_packed_placeholders(self) -> None:
-        """Register meta packed storage params from config shapes (no bf16 weights).
-
-        Used by the passthrough path so a packed fp4 checkpoint loads straight into
-        these params without ever materializing bf16 experts. Config-driven, so it is
-        shared by the torch (``GroupedExpertsMXFP4``) and DeepEP
-        (``GroupedExpertsDeepEPMXFP4``) frozen variants.
-        """
-        cfg = self.config
-        block = MXFP4_BLOCK_SIZE
-        up_proj_dim = cfg.moe_inter_dim * 2 if self.is_gated else cfg.moe_inter_dim
-        expert_dim = cfg.expert_dim
-        moe_inter = cfg.moe_inter_dim
-        e = cfg.n_routed_experts
-        assert expert_dim % block == 0 and moe_inter % block == 0, (
-            f"expert dims must be divisible by {block} for mxfp4 (expert_dim={expert_dim}, moe_inter={moe_inter})"
-        )
-        # Checkpoint orientation [E, out, in], packed along the contraction (in) dim.
-        shapes = {
-            "gate_and_up_projs": ((e, up_proj_dim, expert_dim // 2), (e, up_proj_dim, expert_dim // block)),
-            "down_projs": ((e, expert_dim, moe_inter // 2), (e, expert_dim, moe_inter // block)),
-        }
-        for name, (packed_shape, scale_shape) in shapes.items():
-            packed = torch.empty(packed_shape, dtype=torch.int8, device="meta")
-            scales = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device="meta")
-            self.register_packed_base_weight(name, (packed, scales))
-        self._packed_resident = True
-
-    @torch.no_grad()
-    def register_packed_base_weight(self, name: str, tensors: tuple[torch.Tensor, ...], reference=None) -> None:
-        """Register packed storage params for base projection ``name``.
-
-        Decoupled from quantization so it can run either as a post-load conversion
-        (``pack_base_weights`` passes freshly quantized tensors) or at module init
-        (a chunk-loader passes meta placeholders, then loads the quantized
-        checkpoint straight into them — the path that avoids ever materializing
-        bf16 experts at GLM-744B scale). Replaces the bf16 parameter ``name`` if
-        present.
-
-        Args:
-            name: Base projection name (e.g. ``"gate_and_up_projs"``).
-            tensors: Storage tensors in ``_PACKED_SUFFIXES`` order.
-            reference: Optional DTensor whose mesh/placements the storage tensors
-                inherit (use the pre-pack bf16 param, or a meta DTensor at init).
-        """
-        assert len(tensors) == len(self._PACKED_SUFFIXES), (
-            f"expected {len(self._PACKED_SUFFIXES)} tensors {self._PACKED_SUFFIXES}, got {len(tensors)}"
-        )
-        if isinstance(reference, DTensor):
-            tensors = tuple(DTensor.from_local(t, reference.device_mesh, reference.placements) for t in tensors)
-        if name in self._parameters:
-            del self._parameters[name]
-        for suffix, tensor in zip(self._PACKED_SUFFIXES, tensors):
-            self.register_parameter(name + suffix, nn.Parameter(tensor, requires_grad=False))
-
-    @torch.no_grad()
-    def pack_base_weights(self) -> None:
-        """Pack the frozen base projections to mxfp4 and free the bf16 tensors.
-
-        No-op when already packed. Requires the base weights to be materialized.
-        """
-        if self._packed_resident:
-            return
-        for name in self._MXFP4_BASE_NAMES:
-            param = getattr(self, name)
-            local = _to_local(param)
-            assert not local.is_meta, f"pack_base_weights requires materialized '{name}'"
-            # [E, in, out] (compute layout) -> [E, out, in] (checkpoint layout) so the
-            # mx block scales run along the contraction dim.
-            tensors = quantize_mxfp4(local.transpose(-2, -1).contiguous())
-            self.register_packed_base_weight(name, tensors, reference=param)
-        self._packed_resident = True
+    def _quantize_base(self, local_transposed: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Round-to-nearest quantize a materialized base (checkpoint layout) to mxfp4."""
+        return quantize_mxfp4(local_transposed)
 
     def _base_mm(self, x: torch.Tensor, name: str, offs: torch.Tensor) -> torch.Tensor:
         """Grouped GEMM ``x @ W`` over the packed base weight ``name`` (dequant on the fly)."""
@@ -205,7 +119,7 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, _PackedGroupedExpertsForward,
             self.down_proj_bias.data = _to_local(orig_module.down_proj_bias).clone()
         self.gate_and_up_projs.requires_grad_(False)
         self.down_projs.requires_grad_(False)
-        self._init_mxfp4_storage()
+        self._init_packed_storage()
 
 
 class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, _PackedGroupedExpertsDeepEPForward, GroupedExpertsDeepEP):
@@ -236,7 +150,7 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, _PackedGroupedExpertsDe
             dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
         )
         # backend=None leaves use_torch_mm False; inherit the original's choice so the
-        # mxfp4 storage guard enforces torch_mm (set before _init_mxfp4_storage runs).
+        # mxfp4 storage guard enforces torch_mm (set before _init_packed_storage runs).
         self.use_torch_mm = orig_module.use_torch_mm
 
         if passthrough:
@@ -254,4 +168,4 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, _PackedGroupedExpertsDe
             self.down_proj_bias.data = _to_local(orig_module.down_proj_bias).clone()
         self.gate_and_up_projs.requires_grad_(False)
         self.down_projs.requires_grad_(False)
-        self._init_mxfp4_storage()
+        self._init_packed_storage()
