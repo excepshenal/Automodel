@@ -36,7 +36,7 @@ Usage:
     python scripts/build_glm51_int4_crusoe_checkpoint.py \
         --orig  /raid0/data/models/GLM-5.1 \
         --intel /raid0/data/models/GLM-5.1-int4-mixed-AutoRound \
-        --out   /raid0/data/models/GLM-5.1-int4-crusoe \
+        --out   /raid0/GLM-5.1-int4-experts-bf16-base-AutoRound \
         [--dry-run] [--shard-size-gb 10]
 """
 
@@ -190,7 +190,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--orig", default="/raid0/data/models/GLM-5.1")
     ap.add_argument("--intel", default="/raid0/data/models/GLM-5.1-int4-mixed-AutoRound")
-    ap.add_argument("--out", default="/raid0/data/models/GLM-5.1-int4-crusoe")
+    ap.add_argument("--out", default="/raid0/GLM-5.1-int4-experts-bf16-base-AutoRound")
     ap.add_argument("--shard-size-gb", type=float, default=10.0)
     ap.add_argument("--dry-run", action="store_true", help="Validate key coverage; write nothing.")
     args = ap.parse_args()
