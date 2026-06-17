@@ -43,7 +43,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   # INC4AI mixed-int4 (auto-round) GLM-5.1 checkpoint (local path recommended for offline runs).
-  pretrained_model_name_or_path: /raid0/data/models/GLM-5.1-int4-AutoRound
+  pretrained_model_name_or_path: /raid0/data/models/GLM-5.1-int4-mixed-AutoRound
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa

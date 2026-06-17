@@ -86,6 +86,18 @@ NNODES="${NNODES:-2}"
 NODE_RANK="${NODE_RANK:-0}"
 RDZV_ENDPOINT="${RDZV_ENDPOINT:-127.0.0.1:29500}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+# Recipe to run. Default is the bf16 GLM-5.1 LoRA recipe; point at
+# examples/llm_finetune/glm/glm_5.1_lora_int4.yaml for the mixed-int4 checkpoint
+# (set MODEL_PATH to the int4 dir and EXPERTS=torch_mm; int4 needs the torch_mm path).
+RECIPE="${RECIPE:-examples/llm_finetune/glm/glm_5.1_lora.yaml}"
+# Checkpoint knobs. For int4 a consolidated save would hit the not-yet-implemented int8
+# to_hf emission, so for int4 smoke runs set CKPT_ENABLED=false (adapter-only or no save).
+CKPT_ENABLED="${CKPT_ENABLED:-true}"
+SAVE_CONSOLIDATED="${SAVE_CONSOLIDATED:-true}"
+# Optional host HF cache to mount (datasets/tokenizers) when the recipe pulls a hub dataset
+# id (e.g. rowan/hellaswag) under HF_*_OFFLINE=1. Mounted read-write because HF `datasets`
+# acquires a FileLock in the cache dir on load. Empty = not mounted.
+HF_CACHE_DIR="${HF_CACHE_DIR:-}"
 
 # --- preflight on the host ---------------------------------------------------
 [[ -d "$REPO_DIR" ]] || { echo "FATAL: REPO_DIR not found: $REPO_DIR" >&2; exit 1; }
@@ -122,12 +134,12 @@ exec torchrun \\
     --master-addr=${RDZV_ENDPOINT%:*} \\
     --master-port=${RDZV_ENDPOINT#*:} \\
     -m nemo_automodel.cli.app \\
-    examples/llm_finetune/glm/glm_5.1_lora.yaml \\
+    $RECIPE \\
     --model.pretrained_model_name_or_path $MODEL_PATH \\
-    --checkpoint.enabled true \\
+    --checkpoint.enabled $CKPT_ENABLED \\
     --checkpoint.checkpoint_dir $CKPT_DIR \\
     --checkpoint.model_save_format safetensors \\
-    --checkpoint.save_consolidated true \\
+    --checkpoint.save_consolidated $SAVE_CONSOLIDATED \\
     --distributed.pp_size $PP_SIZE \\
     --distributed.ep_size $EP_SIZE \\
     --distributed.activation_checkpointing $ACT_CKPT \\
@@ -175,9 +187,11 @@ exec docker run --rm \
     -e HF_HUB_OFFLINE=1 \
     -e HF_DATASETS_OFFLINE=1 \
     -e TRANSFORMERS_OFFLINE=1 \
+    ${HF_CACHE_DIR:+-e HF_HOME="$HF_CACHE_DIR"} \
     -v "$REPO_DIR:/opt/Automodel" \
     -v "$MODEL_PATH:$MODEL_PATH:ro" \
     -v "$(dirname "$CKPT_DIR"):$(dirname "$CKPT_DIR")" \
+    ${HF_CACHE_DIR:+-v "$HF_CACHE_DIR:$HF_CACHE_DIR"} \
     -w /opt/Automodel \
     "$IMAGE" \
     bash -c "$IN_CONTAINER_CMD"
