@@ -25,8 +25,8 @@
 # so this is the scalable EP path for DSV4 at EP=8/64.
 # On an 8-GPU NVLink node, set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8.
 #
-# Only the experts are quantized; every other weight (MLA attention, dense MLP,
-# embeddings, MTP, lm_head) stays bf16. The routed experts are ~90%+ of the
+# Routed experts stay packed; other weights use their model-defined floating-point
+# dtypes, including the FP32 lm_head. The routed experts are ~90%+ of the
 # parameters, so packing them to ~4 bits cuts steady-state base-weight memory by
 # roughly 4x relative to the bf16 LoRA recipe.
 #
@@ -75,11 +75,6 @@ model:
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
     name_or_path: deepseek-ai/DeepSeek-V4-Flash
     num_nextn_predict_layers: 0
-    # Required by FusedLinearCrossEntropy: the trainer calls the model with
-    # logits_to_keep=1 and reads out.hidden_states to apply the fused lm_head + CE
-    # without materializing full [seq, vocab] logits. The forward only populates
-    # hidden_states when config.output_hidden_states is set.
-    output_hidden_states: true
   trust_remote_code: false
   load_base_model: true
   backend:
@@ -129,13 +124,8 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
-  # Fused linear cross-entropy (Apple cut_cross_entropy): applies the lm_head + CE without
-  # materializing the [seq, vocab=129280] logits, removing the ~16 GiB fp32 logits spike and
-  # raising the single-node context ceiling (~30k -> ~36-38k tokens on one 8xH200). Uses the
-  # DSV4 forward's logits_to_keep / hidden_states path; loss stays fp32-quality (cut_cross_entropy
-  # accumulates the logsumexp in fp32 internally). Swap back to masked_ce.MaskedCrossEntropy if
-  # cut_cross_entropy is unavailable.
-  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  # Use the model's FP32 lm_head projection and compute CE from full logits.
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag

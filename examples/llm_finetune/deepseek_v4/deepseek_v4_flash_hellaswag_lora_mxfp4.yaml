@@ -16,8 +16,8 @@
 # routed experts kept resident in mxfp4 (fp4-e2m1 + e8m0 block scales) and
 # dequantized on the fly in the grouped-GEMM forward/backward.
 #
-# Only the experts are quantized; every other weight (MLA attention, dense MLP,
-# embeddings, MTP, lm_head) stays bf16. The routed experts are ~90%+ of the
+# Routed experts stay packed; other weights use their model-defined floating-point
+# dtypes, including the FP32 lm_head. The routed experts are ~90%+ of the
 # parameters, so packing them to ~4 bits cuts steady-state base-weight memory by
 # roughly 4x relative to the bf16 LoRA recipe.
 #
@@ -65,11 +65,6 @@ model:
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
     name_or_path: deepseek-ai/DeepSeek-V4-Flash
     num_nextn_predict_layers: 0
-    # Required by FusedLinearCrossEntropy: the trainer calls the model with
-    # logits_to_keep=1 and reads out.hidden_states to apply the fused lm_head + CE
-    # without materializing full [seq, vocab] logits. The forward only populates
-    # hidden_states when config.output_hidden_states is set.
-    output_hidden_states: true
   trust_remote_code: false
   load_base_model: true
   backend:
@@ -88,10 +83,10 @@ peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules:
     # attention
-    - "*wq_a"
-    - "*wq_b"
-    - "*wkv"
-    - "*wo_b"
+    - "*.self_attn.wq_a"
+    - "*.self_attn.wq_b"
+    - "*.self_attn.wkv"
+    - "*.self_attn.wo_b"
     # routed experts: GroupedExperts -> GroupedExpertsLoRAMXFP4
     # (frozen base stays mxfp4-packed; only the LoRA adapters train)
     - "*mlp.experts"
@@ -102,10 +97,9 @@ peft:
   dim: 8
   alpha: 32
   use_triton: True
-  # fp32 LoRA adapters: fp32 master weights + fp32 AdamW state for stability (small-update
-  # swamping), while FSDP2's param_dtype=bf16 still runs the adapter matmuls in bf16. Adapters
-  # are tiny so the fp32 optimizer-state cost is negligible. Matches HF PEFT's default.
-  lora_dtype: float32
+  # BF16 adapters match the BF16 base weights within FSDP-owned modules.
+  # FusedAdam below retains FP32 master-weight precision and optimizer states.
+  lora_dtype: bfloat16
   # Keep the frozen routed experts packed as mxfp4 and dequantize on the fly.
   expert_weight_format: mxfp4
 
@@ -118,12 +112,8 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
-  # Fused linear cross-entropy (Apple cut_cross_entropy): applies the lm_head + CE without
-  # materializing the [seq, vocab=129280] logits, removing the ~16 GiB fp32 logits spike and
-  # raising the single-node context ceiling. Uses the DSV4 forward's logits_to_keep /
-  # hidden_states path; loss stays fp32-quality (cut_cross_entropy accumulates the logsumexp in
-  # fp32 internally). Swap back to masked_ce.MaskedCrossEntropy if cut_cross_entropy is unavailable.
-  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  # Use the model's FP32 lm_head projection and compute CE from full logits.
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -160,9 +150,17 @@ validation_dataloader:
   drop_last: true
 
 optimizer:
-  _target_: torch.optim.AdamW
-  fused: true
+  # Keep the BF16 adapter parameters/checkpoint while TE FusedAdam reconstructs
+  # FP32 master weights from the BF16 values plus their stored 16-bit remainders.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.95]
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
